@@ -1,165 +1,206 @@
+# file: esup_auto_hide.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-import io
+import itertools
+
+st.set_page_config(page_title="Auto Hide Frequent Itemsets", layout="wide")
 
 # ==========================
-# HÀM TÍNH EXPECTED SUPPORT
+# Chuẩn hoá dữ liệu
 # ==========================
-def expected_support(df, itemset):
-    """Tính ESup của một tập mục trong CSDL không chắc chắn."""
-    esup = 0
-    for _, row in df.iterrows():
-        prob = np.prod([row[item] for item in itemset])
-        esup += prob
-    return esup
+def prepare_df(df):
+    possible_id_cols = ['TID', 'Id', 'id', 'tid', 'transaction']
+    for c in possible_id_cols:
+        if c in df.columns:
+            df = df.drop(columns=[c])
+    return df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
 
 # ==========================
-# 3 GIẢI THUẬT HEURISTIC
+# eSup của 1 transaction
 # ==========================
-def u_aggregate(df, itemset, minsup):
-    df_mod = df.copy()
-    while expected_support(df_mod, itemset) >= minsup and len(df_mod) > 0:
-        df_mod["contrib"] = df_mod.apply(lambda r: np.prod([r[i] for i in itemset]), axis=1)
-        max_idx = df_mod["contrib"].idxmax()
-        df_mod = df_mod.drop(index=max_idx)
-    return df_mod.drop(columns="contrib", errors='ignore')
+def esup_transaction_safe(row, itemset):
+    prob = 1.0
+    for item in itemset:
+        try:
+            prob *= float(row.get(item, 0.0))
+        except Exception:
+            prob *= 0.0
+    return prob
 
-def u_disaggregate(df, itemset, minsup, remove_all=False):
-    """
-    U-Disaggregate: Xóa item nhạy cảm trong các giao dịch có đóng góp lớn nhất
-    để làm giảm Expected Support của tập mục nhạy cảm.
-    
-    - remove_all=False: chỉ xóa item đầu tiên trong itemset
-    - remove_all=True: xóa toàn bộ item trong itemset
-    """
-    df_mod = df.copy()
+# ==========================
+# Tính eSup toàn bộ (1,2,3)
+# ==========================
+def compute_global_esup(df):
+    items = df.columns.tolist()
+    summary = []
+    N = len(df)
+    if N == 0:
+        return pd.DataFrame(columns=["Itemset", "eSup"])
+    for k in (1, 2, 3):
+        for subset in itertools.combinations(items, k):
+            total = 0.0
+            for _, row in df.iterrows():
+                total += esup_transaction_safe(row, subset)
+            summary.append({"Itemset": tuple(subset), "eSup": total / N})
+    return pd.DataFrame(summary).sort_values(by="eSup", ascending=False).reset_index(drop=True)
 
-    while expected_support(df_mod, itemset) >= minsup:
-        # Tính độ đóng góp của từng giao dịch
-        contrib = df_mod.apply(lambda r: np.prod([r[i] for i in itemset]), axis=1)
-        max_idx = contrib.idxmax()  # chọn dòng có contrib cao nhất
+# ==========================
+# Aggregate
+# ==========================
+def aggregate(df, frequent_sets, min_sup=0.5):
+    if df.empty:
+        return df.copy()
+    sanitized = df.copy().reset_index(drop=True)
 
-        # Xóa item nhạy cảm trong giao dịch đó
-        if remove_all:
+    def compute_esup(data, itemset):
+        total = 0.0
+        for _, row in data.iterrows():
+            prob = 1.0
             for i in itemset:
-                df_mod.loc[max_idx, i] = 0
-        else:
-            df_mod.loc[max_idx, itemset[0]] = 0  # chỉ xóa item đầu tiên
+                prob *= float(row.get(i, 0))
+            total += prob
+        return total / len(data) if len(data) > 0 else 0.0
 
-    return df_mod
+    popular_items = set()
+    for s in frequent_sets:
+        if isinstance(s, str):
+            try: s = eval(s)
+            except: s = (s,)
+        for i in s: popular_items.add(i)
 
+    while True:
+        current_esup = {x: compute_esup(sanitized, (x,)) for x in popular_items}
+        if all(v < min_sup for v in current_esup.values()):
+            break
 
-def u_hybrid(df, itemset, minsup):
-    df_mod = u_disaggregate(df, itemset, minsup, reduce_factor=0.7)
-    df_mod = u_aggregate(df_mod, itemset, minsup)
-    return df_mod
+        scores = []
+        for idx, row in sanitized.iterrows():
+            count_popular = sum(1 for x in popular_items if row.get(x, 0) > 0)
+            if count_popular == 0: continue
+            total_influence = sum(row.get(x, 0) for x in popular_items)
+            scores.append((idx, count_popular, total_influence))
+
+        if not scores: break
+        scores.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        to_remove = scores[0][0]
+        sanitized = sanitized.drop(index=to_remove).reset_index(drop=True)
+
+    return sanitized
 
 # ==========================
-# DIFFERENTIAL PRIVACY (DP)
+# Disaggregate
 # ==========================
-def add_dp_noise(esup, epsilon=1.0, delta_f=1.0):
-    noise = np.random.laplace(0, delta_f/epsilon)
-    return esup + noise
+def disaggregate(df, frequent_sets):
+    sanitized = df.copy()
+    for idx, row in sanitized.iterrows():
+        f_values = {}
+        for subset in frequent_sets:
+            if all(row.get(i, 0) > 0 for i in subset):
+                for x in subset:
+                    a_kx = row[x]; pr_x_in_k = row[x]; b_kx = 1.0
+                    for y in subset:
+                        if y != x: b_kx *= row[y]
+                    f_kx = b_kx / (a_kx * pr_x_in_k) if a_kx * pr_x_in_k != 0 else 0.0
+                    f_values[x] = max(f_values.get(x, 0.0), f_kx)
+        if f_values:
+            max_item = max(f_values, key=f_values.get)
+            sanitized.at[idx, max_item] = 0.0
+    return sanitized
 
 # ==========================
-# GIAO DIỆN STREAMLIT
+# Hybrid 50–50 (rút gọn log)
 # ==========================
-st.set_page_config(page_title="Heuristic + Differential Privacy", layout="wide")
-st.title("🔒 Ẩn các tập mục nhạy cảm trong CSDL không chắc chắn")
-st.markdown("### Gồm 2 giai đoạn: Heuristic Hiding → Differential Privacy")
+def hybrid(df, frequent_sets, min_sup=0.5):
+    if df.empty:
+        return df.copy()
+    sanitized = df.copy().reset_index(drop=True)
+
+    popular_items = set()
+    for s in frequent_sets:
+        if isinstance(s, str):
+            try: s = eval(s)
+            except: s = (s,)
+        for i in s: popular_items.add(i)
+
+    def compute_esup(data, item):
+        total = 0.0
+        for _, row in data.iterrows():
+            total += float(row.get(item, 0))
+        return total / len(data) if len(data) > 0 else 0.0
+
+    def transaction_influence(row):
+        return sum(float(row.get(i, 0)) for i in popular_items)
+
+    while True:
+        esup_values = {i: compute_esup(sanitized, i) for i in popular_items}
+        if all(v < min_sup for v in esup_values.values()):
+            break
+        N = len(sanitized)
+        if N == 0: break
+
+        half = max(1, N // 2)
+        sanitized["influence"] = sanitized.apply(transaction_influence, axis=1)
+        sanitized = sanitized.sort_values(by="influence", ascending=False).reset_index(drop=True)
+        sanitized = sanitized.drop(index=list(range(min(half, len(sanitized))))).reset_index(drop=True)
+
+        if len(sanitized) == 0: break
+
+        num_to_hide = max(1, len(sanitized) // 2)
+        sanitized["influence"] = sanitized.apply(transaction_influence, axis=1)
+        top_rows = sanitized.sort_values(by="influence", ascending=False).head(num_to_hide)
+        for idx in top_rows.index:
+            row = sanitized.loc[idx]
+            item_values = {i: row.get(i, 0) for i in popular_items}
+            target_item = max(item_values, key=item_values.get)
+            if row.get(target_item, 0) > 0:
+                sanitized.at[idx, target_item] = 0.0
+        sanitized = sanitized.drop(columns=["influence"])
+        if all(v < min_sup for v in {i: compute_esup(sanitized, i) for i in popular_items}.values()):
+            break
+
+    return sanitized.reset_index(drop=True)
 
 # ==========================
-# NHẬP DỮ LIỆU
+# Giao diện Streamlit
 # ==========================
-st.sidebar.header("📥 Nhập dữ liệu")
-uploaded_file = st.sidebar.file_uploader("Chọn file TXT hoặc CSV", type=["txt", "csv"])
+st.title("🔒 Ẩn Tập Mục Phổ Biến Tự Động (Heuristic)")
 
-if uploaded_file is not None:
+uploaded_file = st.file_uploader("📂 Tải file dữ liệu CSV/TXT", type=["csv", "txt"])
+
+if uploaded_file:
     try:
-        if uploaded_file.name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
-        elif uploaded_file.name.endswith(".txt"):
-            content = uploaded_file.read().decode("utf-8")
-            df = pd.read_csv(io.StringIO(content), delim_whitespace=True)
-            if not all(isinstance(x, str) for x in df.columns):
-                num_cols = df.shape[1]
-                df.columns = [f"I{i+1}" for i in range(num_cols)]
-    except Exception as e:
-        st.error(f"Lỗi khi đọc file: {e}")
-        st.stop()
-else:
-    st.sidebar.info("Hoặc dùng dữ liệu ví dụ:")
-    df = pd.DataFrame({
-        'A': [0.9, 0.7, 0.2],
-        'B': [0.6, 0.5, 0.9],
-        'C': [0.1, 0.4, 0.3]
-    })
+        df_raw = pd.read_csv(uploaded_file, sep=None, engine="python")
+    except Exception:
+        df_raw = pd.read_csv(uploaded_file, engine="python")
 
-st.write("### 🧮 Cơ sở dữ liệu ban đầu:")
-st.dataframe(df)
+    st.subheader("📋 Dữ liệu gốc")
+    st.dataframe(df_raw)
 
-# ==========================
-# CHỌN THAM SỐ
-# ==========================
-items = list(df.columns)
-itemset = st.multiselect("Chọn tập mục nhạy cảm:", items)
-if len(itemset) == 0:
-    st.warning("⚠️ Vui lòng chọn ít nhất một mục trong tập nhạy cảm.")
-    st.stop()
+    df = prepare_df(df_raw)
+    global_esup = compute_global_esup(df)
 
-minsup = st.slider("Ngưỡng hỗ trợ kỳ vọng (min_esup)", 0.1, float(len(df)), 1.0, 0.1)
-epsilon = st.slider("Giá trị ε (Differential Privacy)", 0.1, 5.0, 1.0, 0.1)
-algo = st.selectbox("Chọn giải thuật Heuristic:", ["U-Aggregate", "U-Disaggregate", "U-Hybrid"])
+    st.subheader("📈 Expected Support (eSup)")
+    st.dataframe(global_esup)
 
-# ==========================
-# GIAI ĐOẠN 1: HEURISTIC HIDING
-# ==========================
-st.markdown("---")
-st.subheader("🧱 Giai đoạn 1 – Ẩn tập mục nhạy cảm bằng Heuristic")
+    min_esup = st.slider("Chọn ngưỡng min_eSup", 0.0, 1.0, 0.5, 0.05)
+    frequent_sets = [tuple(x) for x in global_esup[global_esup["eSup"] >= min_esup]["Itemset"].tolist()]
+    st.subheader("🔥 Tập mục phổ biến được phát hiện")
+    st.write(frequent_sets if frequent_sets else "Không có tập nào vượt ngưỡng.")
 
-if st.button("▶️ Thực thi Giai đoạn 1"):
-    esup_before = expected_support(df, itemset)
-    st.info(f"🔹 Expected Support ban đầu của tập {itemset}: **{esup_before:.4f}**")
+    method = st.selectbox("🧩 Thuật toán ẩn:", ["Aggregate", "Disaggregate", "Hybrid"])
 
-    if esup_before < minsup:
-        st.warning("⚠️ Tập mục này KHÔNG phải frequent (ESup < min_sup) → không cần ẩn.")
-        st.stop()
+    if frequent_sets:
+        if method == "Aggregate":
+            sanitized = aggregate(df, frequent_sets)
+        elif method == "Disaggregate":
+            sanitized = disaggregate(df, frequent_sets)
+        else:
+            sanitized = hybrid(df, frequent_sets, min_sup=min_esup)
 
-    if algo == "U-Aggregate":
-        df_hidden = u_aggregate(df, itemset, minsup)
-        method = "U-Aggregate"
-    elif algo == "U-Disaggregate":
-        df_hidden = u_disaggregate(df, itemset, minsup)
-        method = "U-Disaggregate"
+        st.subheader("📉 Dữ liệu sau khi ẩn")
+        st.dataframe(sanitized)
+        st.success("✅ Hoàn tất quá trình ẩn dữ liệu.")
     else:
-        df_hidden = u_hybrid(df, itemset, minsup)
-        method = "U-Hybrid"
-
-    esup_after = expected_support(df_hidden, itemset)
-    st.success(f"✅ Đã áp dụng {method}! ESup sau khi ẩn = {esup_after:.4f}")
-
-    st.write("### ✅ CSDL sau khi ẩn:")
-    st.dataframe(df_hidden)
-
-    # Lưu kết quả giai đoạn 1 vào session_state
-    st.session_state["df_hidden"] = df_hidden
-    st.session_state["esup_after"] = esup_after
-
-# ==========================
-# GIAI ĐOẠN 2: DIFFERENTIAL PRIVACY
-# ==========================
-st.markdown("---")
-st.subheader("🔐 Giai đoạn 2 – Thêm Differential Privacy (DP)")
-
-if "df_hidden" in st.session_state:
-    df_hidden = st.session_state["df_hidden"]
-    esup_after = st.session_state["esup_after"]
-
-    if st.button("🧮 Áp dụng Giai đoạn 2 (DP)"):
-        esup_noisy = add_dp_noise(esup_after, epsilon)
-        st.info(f"Expected Support gốc sau ẩn: **{esup_after:.4f}**")
-        st.success(f"Expected Support sau khi thêm nhiễu (ε={epsilon}): **{esup_noisy:.4f}**")
-        st.write("✅ Dữ liệu đã được bảo vệ thêm bằng Differential Privacy.")
+        st.info("Không có tập phổ biến nào vượt ngưỡng để ẩn.")
 else:
-    st.warning("⚠️ Hãy chạy Giai đoạn 1 trước khi áp dụng Giai đoạn 2 (DP).")
+    st.info("📥 Hãy tải file dữ liệu để bắt đầu.")
